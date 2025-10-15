@@ -1,0 +1,547 @@
+import fetch from 'node-fetch'
+import { ProjectAnalyzer } from './projectAnalyzer'
+import { ContextAnalyzer } from './contextAnalyzer'
+import { ChangeValidator } from './changeValidator'
+import { RepoFile } from './repoFetcher'
+const JSON5 = require('json5')
+const balancedMatch: any = require('balanced-match')
+
+export type Change = { path: string; content: string }
+
+async function callOpenAI(prompt: string) {
+  const key = process.env.OPENAI_API_KEY || process.env.VERCEL_AI_KEY
+  if (!key) return null
+
+  const body = {
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'You are a helpful assistant that outputs a JSON array of file changes.' },
+      { role: 'user', content: prompt }
+    ],
+    max_tokens: 1500
+  }
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body)
+  })
+
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(`OpenAI error: ${res.status} ${txt}`)
+  }
+
+  const json: any = await res.json()
+  const text = json.choices?.[0]?.message?.content || json.choices?.[0]?.text || ''
+  return { text, raw: json }
+}
+
+async function callAnthropic(prompt: string) {
+  const key = process.env.ANTHROPIC_API_KEY
+  if (!key) return null
+
+  // Default to the most capable Claude 3 model; allow override via ANTHROPIC_MODEL
+  const model = process.env.ANTHROPIC_MODEL || 'claude-3-opus-20240229' // Most capable model as of 2025
+
+  const body: any = {
+    model,
+    prompt,
+    max_tokens_to_sample: 1500
+  }
+
+  const res = await fetch('https://api.anthropic.com/v1/complete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+    body: JSON.stringify(body)
+  })
+
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(`Anthropic error: ${res.status} ${txt}`)
+  }
+
+  const json: any = await res.json()
+  // Anthropic returns `completion` (text) in many API versions
+  const text = json.completion || json.output || ''
+  return { text, raw: json }
+}
+
+function extractJSON(output: string) {
+  // Try direct JSON
+  try {
+    const parsed = JSON.parse(output)
+    return { parsed, raw: output }
+  } catch (e) {}
+
+  // Try JSON5
+  try {
+    const parsed = JSON5.parse(output)
+    return { parsed, raw: output }
+  } catch (e) {}
+
+  // Try to extract the first bracketed JSON object/array
+  try {
+    const m = balancedMatch('[', ']', output)
+    if (m && m.body) {
+      const candidate = `[${m.body}]`
+      try {
+        const parsed = JSON.parse(candidate)
+        return { parsed, raw: candidate }
+      } catch (e) {
+        try {
+          const parsed = JSON5.parse(candidate)
+          return { parsed, raw: candidate }
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+
+  return null
+}
+
+// Project-wide patterns and requirements
+const PROJECT_PATTERNS = {
+  architecture: [
+    'Clean Architecture principles',
+    'Service/Repository pattern',
+    'Dependency injection',
+    'Clear separation of concerns'
+  ],
+  codeStyle: [
+    'Consistent error handling with typed errors',
+    'Comprehensive TypeScript types',
+    'Async/await for promises',
+    'Functional programming patterns where appropriate'
+  ],
+  testing: [
+    'Unit tests for business logic',
+    'Integration tests for APIs',
+    'Mocking external dependencies',
+    'Test coverage for critical paths'
+  ],
+  security: [
+    'Input validation',
+    'Type-safe operations',
+    'Proper error handling',
+    'Secure default configurations'
+  ]
+}
+
+const STYLE_GUIDE = {
+  indentation: '2 spaces',
+  quotes: 'single',
+  semicolons: true,
+  maxLineLength: 100,
+  imports: 'sorted and grouped',
+  naming: {
+    interfaces: 'PascalCase with I prefix',
+    types: 'PascalCase',
+    functions: 'camelCase',
+    constants: 'UPPER_CASE'
+  }
+}
+
+const CODE_REQUIREMENTS = {
+  typeChecking: true,
+  errorHandling: true,
+  documentation: true,
+  testing: true,
+  security: true
+}
+
+// Type definitions
+interface ProjectContext {
+  dependencies: {
+    production: string[]
+    development: string[]
+    peer: string[]
+  }
+  frameworks: string[]
+  patterns: Array<{
+    type: string
+    examples: string[]
+  }>
+  fileTypes: Array<{
+    extension: string
+    count: number
+  }>
+}
+
+interface AnalysisResult {
+  relevantFiles: string[]
+  typeDefinitions: string[]
+  relatedPatterns: string[]
+}
+
+interface ExtendedProjectContext extends ProjectContext {
+  packageJson: {
+    dependencies: { [key: string]: string }
+    devDependencies: { [key: string]: string }
+    peerDependencies: { [key: string]: string }
+  }
+}
+
+export async function generateChanges(prompt: string, repoPreview?: string, files?: RepoFile[]): Promise<{ changes: Change[]; aiRaw?: any }> {
+  if (!files || files.length === 0) {
+    throw new Error('Repository files are required for context analysis')
+  }
+
+  // Initialize analyzers
+  const projectAnalyzer = new ProjectAnalyzer(files)
+  const contextAnalyzer = new ContextAnalyzer(files)
+
+  // 1. Analyze project structure
+  const projectContext: ProjectContext = projectAnalyzer.analyze()
+
+  // 2. Extract target file from prompt
+  const fileMatch = prompt.match(/(?:modify|update|change|fix|in|create|the file)\s+['"](.*?)['"]/i)
+  const targetFile = fileMatch ? fileMatch[1] : ''
+
+  // 3. Build file context analysis
+  const analysis: AnalysisResult = targetFile
+    ? contextAnalyzer.analyzeContext(targetFile, prompt)
+    : { relevantFiles: [], typeDefinitions: [], relatedPatterns: [] }
+
+  // 4. Format dependencies section
+  const dependenciesSection = [
+    ...projectContext.dependencies.production.map((d: string) => `- ${d} (production)`),
+    ...projectContext.dependencies.development.map((d: string) => `- ${d} (dev)`),
+    ...projectContext.dependencies.peer.map((d: string) => `- ${d} (peer)`)
+  ].join('\n')
+
+  // 5. Format patterns section
+  const patternsSection = projectContext.patterns
+    .map((pattern: { type: string; examples: string[] }) => 
+      `${pattern.type}:\n${pattern.examples.map((e: string) => `  - ${e}`).join('\n')}`
+    )
+    .join('\n\n')
+
+  // 6. Format file types section
+  const fileTypesSection = projectContext.fileTypes
+    .map((ft: { extension: string; count: number }) => `- ${ft.extension}: ${ft.count} files`)
+    .join('\n')
+
+  // 7. Build the enhanced prompt with thorough context
+  const enhancedPrompt = [
+    'You are an expert TypeScript developer working in this repository.',
+    'Your task is to make safe, incremental improvements while preserving functionality.',
+    'Follow these CRITICAL guidelines:',
+    '',
+    'CORE REQUIREMENTS:',
+    '1. PRESERVE FUNCTIONALITY - Existing behavior must be maintained exactly',
+    '2. DEPENDENCY SAFETY - Use ONLY the dependencies listed below',
+    '3. PATTERN MATCHING - Follow the exact patterns shown in related files',
+    '4. INCREMENTAL CHANGES - Make small, focused improvements rather than rewrites',
+    '5. TYPE SAFETY - Maintain or enhance type safety; never remove type information',
+    '',
+    'PROJECT STRUCTURE:',
+    'Available Dependencies:',
+    dependenciesSection,
+    '',
+    'Framework Detection:',
+    projectContext.frameworks.length > 0
+      ? projectContext.frameworks.map((f: string) => `- ${f}`).join('\n')
+      : '(No frameworks detected)',
+    '',
+    'Implementation Patterns:',
+    projectContext.patterns.length > 0
+      ? projectContext.patterns
+          .map((p: { type: string; examples: string[] }) => 
+            `${p.type}:\n${p.examples.map((e: string) => `  - ${e}`).join('\n')}`
+          ).join('\n\n')
+      : '(No patterns detected)',
+    '',
+    'File Analysis:',
+    projectContext.fileTypes.length > 0
+      ? projectContext.fileTypes
+          .map((ft: { extension: string; count: number }) => 
+            `- ${ft.extension}: ${ft.count} files`
+          ).join('\n')
+      : '(No files analyzed)',
+    '',
+    'TARGET ANALYSIS:',
+    `Primary Target: ${targetFile || '(No specific file targeted)'}`,
+    '',
+    'Related Files:',
+    analysis.relevantFiles.length > 0
+      ? analysis.relevantFiles.map((f: string) => `- ${f}`).join('\n')
+      : '(No related files found)',
+    '',
+    'Relevant Types:',
+    analysis.typeDefinitions.length > 0 
+      ? analysis.typeDefinitions.map((t: string) => `- ${t}`).join('\n')
+      : '(No relevant type definitions found)',
+    '',
+    'Detected Patterns:',
+    analysis.relatedPatterns.length > 0
+      ? analysis.relatedPatterns.map((p: string) => `- ${p}`).join('\n')
+      : '(No relevant patterns detected)',
+    '',
+    'Based on these patterns and the repository context, implement these changes:',
+    prompt,
+    '',
+    'Respond ONLY with a JSON array of file changes. Each object must have:',
+    '{',
+    '  "path": "relative/path.ext",',
+    '  "content": "complete file contents with ALL imports and types"',
+    '}'
+  ].join('\n')
+
+  const fullPrompt = enhancedPrompt
+
+  // Attempt to get changes from Claude first (preferred model)
+  try {
+    const anthropic = await callAnthropic(enhancedPrompt)
+    if (anthropic?.text) {
+      const result = processAIResponse(anthropic.text, files)
+      if (result) {
+        return { changes: result.validatedChanges, aiRaw: anthropic.raw }
+      }
+    }
+  } catch (anthropicError: any) {
+    console.warn('Anthropic generation failed:', anthropicError.message)
+  }
+
+  // Fall back to OpenAI if Claude fails
+  try {
+    const openai = await callOpenAI(enhancedPrompt)
+    if (openai?.text) {
+      const result = processAIResponse(openai.text, files)
+      if (result) {
+        return { changes: result.validatedChanges, aiRaw: openai.raw }
+      }
+    }
+  } catch (openaiError: any) {
+    console.error('OpenAI generation failed:', openaiError.message)
+  }
+
+  // If both AI models fail, return a clear error
+  console.error('Failed to generate valid changes')
+  return {
+    changes: [{
+      path: 'ERROR.md',
+      content: [
+        '# Error: Failed to Generate Changes',
+        '',
+        '## Request:',
+        prompt,
+        '',
+        '## Context Analysis:',
+        `- Target File: ${targetFile || 'Not specified'}`,
+        `- Related Files: ${analysis.relevantFiles.length} found`,
+        `- Type Definitions: ${analysis.typeDefinitions.length} found`,
+        `- Patterns: ${analysis.relatedPatterns.length} detected`,
+        '',
+        '## Debug Information:',
+        '- Claude 3 Opus attempted: Yes',
+        '- GPT-4 fallback attempted: Yes',
+        '- Context provided: Complete',
+        '- Validation: Failed',
+        '',
+        'Please try again with a more specific request or different parameters.'
+      ].join('\n')
+    }],
+    aiRaw: { error: true }
+  }
+}
+
+// Helper function to process AI responses and validate changes
+function processAIResponse(aiText: string, files: RepoFile[]): { validatedChanges: Change[] } | null {
+  const extracted = extractJSON(aiText)
+  if (!extracted || !Array.isArray(extracted.parsed)) {
+    return null
+  }
+
+  // Convert parsed JSON to Change objects
+  const proposedChanges: Change[] = extracted.parsed.map((c: any) => ({
+    path: String(c.path),
+    content: String(c.content)
+  }))
+
+  // Validate each change
+  const validator = new ChangeValidator(files)
+  const validatedChanges: Change[] = []
+
+  for (const change of proposedChanges) {
+    const originalFile = files.find(f => f.path === change.path)
+    const validation = validator.validateChange(
+      originalFile?.content || '',
+      change.content,
+      change.path
+    )
+
+    // If there are warnings, add them as comments
+    if (validation.warnings.length > 0) {
+      console.warn(`Warnings for ${change.path}:`, validation.warnings)
+      change.content = [
+        '// ATTENTION: The following warnings were detected:',
+        ...validation.warnings.map(w => `// WARNING: ${w}`),
+        '',
+        change.content
+      ].join('\n')
+    }
+
+    // If the change is invalid, add error comments
+    if (!validation.valid) {
+      console.error(`Validation failed for ${change.path}:`, validation.errors)
+      change.content = [
+        '// ERROR: The following changes need review:',
+        ...validation.errors.map(e => `// ERROR: ${e}`),
+        '',
+        '// Original generated content (needs fixing):',
+        change.content
+      ].join('\n')
+    }
+
+    validatedChanges.push(change)
+  }
+
+  return { validatedChanges }
+}
+
+// Build enhanced prompt with comprehensive project context
+const fullPrompt = `You are an expert TypeScript developer working in this repository. Your task is to make safe, incremental improvements while preserving functionality. Follow these CRITICAL guidelines:
+
+CORE REQUIREMENTS:
+1. PRESERVE FUNCTIONALITY - Existing behavior must be maintained exactly
+2. DEPENDENCY SAFETY - Use ONLY the dependencies listed below
+3. PATTERN MATCHING - Follow the exact patterns shown in related files
+4. INCREMENTAL CHANGES - Make small, focused improvements rather than rewrites
+5. TYPE SAFETY - Maintain or enhance type safety; never remove type information
+
+PROJECT ANALYSIS:
+Available Dependencies:
+${projectContext.dependencies.production
+    .map(d => `- ${d} (production)`)
+    .concat(projectContext.dependencies.development.map(d => `- ${d} (dev)`))
+    .concat(projectContext.dependencies.peer.map(d => `- ${d} (peer)`))
+    .join('\n')}
+
+Framework Detection:
+${projectContext.frameworks.map(f => `- ${f}`).join('\n')}
+
+Implementation Patterns:
+${projectContext.patterns
+    .map(p => `${p.type}:\n${p.examples.map(e => `  - ${e}`).join('\n')}`)
+    .join('\n\n')}
+
+File Structure:
+${projectContext.fileTypes
+    .map(f => `- ${f.extension}: ${f.count} files`)
+    .join('\n')}
+
+RELEVANT CONTEXT:
+Target File: ${targetFile || 'Not specified'}
+
+Related Files:
+${contextAnalysis.relevantFiles.map(f => `- ${f}`).join('\n')}
+
+Type Definitions:
+${contextAnalysis.typeDefinitions.map(t => `- ${t}`).join('\n')}
+
+Architectural Patterns:
+${contextAnalysis.relatedPatterns.map(p => `- ${p}`).join('\n')}
+
+STYLE GUIDE:
+${Object.entries(STYLE_GUIDE)
+  .map(([rule, value]) => typeof value === 'object' 
+    ? `${rule}:\n${Object.entries(value).map(([k, v]) => `- ${k}: ${v}`).join('\n')}`
+    : `- ${rule}: ${value}`)
+  .join('\n')}
+
+CODE REQUIREMENTS:
+${Object.entries(CODE_REQUIREMENTS)
+  .map(([req, enabled]) => `- ${req}: ${enabled ? 'required' : 'optional'}`)
+  .join('\n')}
+
+REPOSITORY CONTEXT:
+${contextAnalysis ? `
+Relevant Files:
+${contextAnalysis.relevantFiles.map(f => `- ${f}`).join('\n')}
+
+Related Types:
+${contextAnalysis.typeDefinitions.map(t => `- ${t}`).join('\n')}
+
+Applicable Patterns:
+${contextAnalysis.relatedPatterns.map(p => `- ${p}`).join('\n')}
+` : repoPreview || ''}
+
+Based on these patterns and the repository context, implement these changes:
+${prompt}
+
+Respond ONLY with a JSON array of file changes. Each object must have:
+{
+  "path": "relative/path.ext",
+  "content": "complete file contents including ALL necessary imports, types, and documentation"
+}`
+
+  // Prefer Anthropic (Claude) if API key present; fall back to OpenAI
+  try {
+    const anthropic = await callAnthropic(fullPrompt)
+    if (anthropic && anthropic.text) {
+      const extracted = extractJSON(anthropic.text)
+      if (extracted && Array.isArray(extracted.parsed)) {
+        const proposedChanges = (extracted.parsed as any[]).map((c: any) => ({ 
+          path: String(c.path), 
+          content: String(c.content) 
+        }))
+
+        // Validate each change
+        const validator = new ChangeValidator(files || [])
+        const validatedChanges: Change[] = []
+
+        for (const change of proposedChanges) {
+          const originalFile = files?.find(f => f.path === change.path)
+          const validation = validator.validateChange(
+            originalFile?.content || '',
+            change.content,
+            change.path
+          )
+
+          if (validation.warnings.length > 0) {
+            console.warn(`Warnings for ${change.path}:`, validation.warnings)
+          }
+
+          if (validation.valid) {
+            validatedChanges.push(change)
+          } else {
+            console.error(`Invalid change for ${change.path}:`, validation.errors)
+            // Add warning comment to the code
+            change.content = `// WARNING: The following changes need review:\n` +
+              validation.errors.map(e => `// - ${e}`).join('\n') +
+              '\n\n' + change.content
+            validatedChanges.push(change)
+          }
+        }
+
+        return { changes: validatedChanges, aiRaw: anthropic.raw || anthropic.text }
+      }
+    }
+  } catch (aErr: any) {
+    // swallow and try OpenAI as fallback
+  }
+
+  // Try OpenAI as a fallback
+  try {
+    const ai = await callOpenAI(fullPrompt)
+    if (ai && ai.text) {
+      // Extract JSON
+      const extracted = extractJSON(ai.text)
+      if (extracted && Array.isArray(extracted.parsed)) {
+        // Normalize to Change[]
+        const changes = (extracted.parsed as any[]).map((c: any) => ({ path: String(c.path), content: String(c.content) }))
+        return { changes, aiRaw: ai.raw || ai.text }
+      }
+      // If parsing failed, fall through to simulated fallback
+    }
+  } catch (err: any) {
+    // swallow and fallback to simulated change
+  }
+
+  // Fallback simulated change
+  const simulated: Change = { path: 'SIMULATED_BY_AI.md', content: `Simulated changes for prompt:\n${prompt}` }
+  return { changes: [simulated], aiRaw: { simulated: true } }
+}
+
+export default { generateChanges }

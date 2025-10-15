@@ -1,0 +1,26 @@
+import { generateChanges as generateChangesEngine } from './aiEngine'
+import { RepoContext } from '../types/projectAnalysis'
+
+export type Change = { path: string; content: string }
+
+export async function generateChanges(request: string, files: { path: string, content: string }[]) : Promise<Change[]> {
+  // Convert files to RepoContext format
+  const repoContext: RepoContext = {
+    files: files.map(f => ({
+      path: f.path,
+      content: f.content,
+      size: Buffer.byteLength(f.content)
+    })),
+    manifest: `Files: ${files.map(f => f.path).join(', ')}`,
+    analysis: {
+      dependencies: {},
+      patterns: [],
+      conventions: []
+    }
+  }
+
+  // Use enhanced engine
+  return generateChangesEngine(request, repoContext)
+}
+
+export default { generateChanges }

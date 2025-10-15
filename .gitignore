@@ -1,0 +1,67 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+
+# TypeScript
+dist/
+*.tsbuildinfo
+
+# Env files
+.env
+.env.*.local
+.env.local
+
+# Logs
+logs/
+*.log
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Build caches
+.cache/
+.next/
+.out/
+
+# Misc
+coverage/
+coverage-final.json
+report.html
+
+# Optional: lockfile for pnpm etc
+.pnp/
+.pnp.js
+
+# Vercel / deployment
+.vercel/
+
+# JetBrains
+*.iml
+
+# Mac
+.DS_Store
+
+# Docker
+docker-compose.override.yml
+
+# Jetpack etc
+.sass-cache/
+
+# Temporary
+*.tmp
+*.temp
+
+# Postman collection environment
+postman/*.postman_environment.json
